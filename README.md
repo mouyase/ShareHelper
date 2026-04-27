@@ -26,5 +26,5 @@
 本地发布脚本：
 
 ```bash
-scripts/publish-release.sh 0.0.1
+scripts/publish-release.sh 0.0.2
 ```
