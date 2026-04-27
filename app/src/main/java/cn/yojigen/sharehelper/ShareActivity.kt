@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -17,14 +18,18 @@ import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
 import androidx.exifinterface.media.ExifInterface
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.nio.ByteBuffer
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
+import java.util.zip.CRC32
+import java.util.zip.DeflaterOutputStream
 import kotlin.math.max
 
 class ShareActivity : Activity() {
@@ -64,7 +69,7 @@ class ShareActivity : Activity() {
         return inputs.mapIndexed { index, input ->
             val exportID = "${batchID}_export_${index}_${UUID.randomUUID()}"
             when {
-                input.mimeType.startsWith(IMAGE_MIME_PREFIX) -> processImage(input.uri, input.mimeType, batchDirectory, index, exportID)
+                input.mimeType.startsWith(IMAGE_MIME_PREFIX) -> processImage(input.uri, batchDirectory, index, exportID)
                 input.mimeType.startsWith(VIDEO_MIME_PREFIX) -> processVideo(input.uri, input.mimeType, batchDirectory, index, exportID)
                 else -> throw IOException("Unsupported media type")
             }
@@ -99,20 +104,10 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun processImage(uri: Uri, mimeType: String, batchDirectory: File, index: Int, exportID: String): ProcessedMedia {
-        val preferredExtension = imageExtensionFor(mimeType)
-        if (preferredExtension != null) {
-            val copiedFile = File(batchDirectory, "image_${index}_${exportID}.$preferredExtension")
-            copyUriToFile(uri, copiedFile)
-            if (writeExportMetadata(copiedFile, exportID)) {
-                return copiedFile.toProcessedMedia(mimeType)
-            }
-        }
-
-        val encodedFile = File(batchDirectory, "image_${index}_${exportID}_encoded.jpg")
-        reencodeImageAsJpeg(uri, encodedFile, exportID)
-        writeExportMetadata(encodedFile, exportID)
-        return encodedFile.toProcessedMedia(IMAGE_JPEG_MIME_TYPE)
+    private fun processImage(uri: Uri, batchDirectory: File, index: Int, exportID: String): ProcessedMedia {
+        val animatedFile = File(batchDirectory, "image_${index}_${exportID}_privacy.png")
+        encodePrivacyApng(uri, animatedFile)
+        return animatedFile.toProcessedMedia(IMAGE_PNG_MIME_TYPE)
     }
 
     private fun processVideo(uri: Uri, mimeType: String, batchDirectory: File, index: Int, exportID: String): ProcessedMedia {
@@ -233,46 +228,210 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun reencodeImageAsJpeg(uri: Uri, outputFile: File, exportID: String) {
-        val bitmap = contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
-            ?: throw IOException("Unable to decode image")
-        val adjustedBitmap = bitmap.withExportPixelDifference(exportID)
+    private fun encodePrivacyApng(uri: Uri, outputFile: File) {
+        val bitmap = decodeOrientedBitmap(uri)
         try {
             FileOutputStream(outputFile).use { outputStream ->
-                if (!adjustedBitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, outputStream)) {
-                    throw IOException("Unable to encode image")
-                }
+                writePrivacyApng(bitmap, outputStream)
             }
         } finally {
-            if (adjustedBitmap !== bitmap) adjustedBitmap.recycle()
             bitmap.recycle()
         }
     }
 
-    private fun Bitmap.withExportPixelDifference(exportID: String): Bitmap {
-        if (width <= 0 || height <= 0) return this
-        val mutableBitmap = if (isMutable) this else copy(Bitmap.Config.ARGB_8888, true)
-        val pixel = mutableBitmap.getPixel(0, 0)
-        val adjustedBlue = (pixel and 0xFF xor (exportID.hashCode() and 0x0F)) and 0xFF
-        val adjustedPixel = (pixel and 0xFFFFFF00.toInt()) or adjustedBlue
-        mutableBitmap.setPixel(0, 0, adjustedPixel)
-        return mutableBitmap
+    private fun decodeOrientedBitmap(uri: Uri): Bitmap {
+        val bitmap = contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
+            ?: throw IOException("Unable to decode image")
+        val orientation = readExifOrientation(uri)
+        val orientationMatrix = orientation.toBitmapMatrix()
+        if (orientationMatrix == null) return bitmap
+
+        return try {
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, orientationMatrix, true)
+        } catch (exception: RuntimeException) {
+            bitmap
+        }.also { orientedBitmap ->
+            if (orientedBitmap !== bitmap) bitmap.recycle()
+        }
     }
 
-    private fun writeExportMetadata(file: File, exportID: String): Boolean {
+    private fun readExifOrientation(uri: Uri): Int {
         return try {
-            val exif = ExifInterface(file.absolutePath)
-            exif.setAttribute(ExifInterface.TAG_SOFTWARE, "ShareHelper")
-            exif.setAttribute(ExifInterface.TAG_IMAGE_UNIQUE_ID, exportID)
-            exif.setAttribute(ExifInterface.TAG_USER_COMMENT, "ExportID=$exportID")
-            exif.setAttribute(ExifInterface.TAG_DATETIME, exifTimestamp())
-            exif.saveAttributes()
-            true
+            contentResolver.openInputStream(uri)?.use { inputStream ->
+                ExifInterface(inputStream).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_UNDEFINED,
+                )
+            } ?: ExifInterface.ORIENTATION_UNDEFINED
         } catch (_: IOException) {
-            false
+            ExifInterface.ORIENTATION_UNDEFINED
         } catch (_: RuntimeException) {
-            false
+            ExifInterface.ORIENTATION_UNDEFINED
         }
+    }
+
+    private fun Int.toBitmapMatrix(): Matrix? {
+        return when (this) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> Matrix().apply { setScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_180 -> Matrix().apply { setRotate(180f) }
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> Matrix().apply {
+                setRotate(180f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSPOSE -> Matrix().apply {
+                setRotate(90f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> Matrix().apply { setRotate(90f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> Matrix().apply {
+                setRotate(-90f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> Matrix().apply { setRotate(-90f) }
+            else -> null
+        }
+    }
+
+    private fun writePrivacyApng(bitmap: Bitmap, outputStream: OutputStream) {
+        if (bitmap.width <= 0 || bitmap.height <= 0) throw IOException("Unable to encode empty image")
+
+        DataOutputStream(outputStream).apply {
+            write(PNG_SIGNATURE)
+            writePngChunk(PNG_CHUNK_IHDR, createIhdrData(bitmap.width, bitmap.height))
+            writePngChunk(PNG_CHUNK_ACTL, createAnimationControlData())
+            writePngChunk(
+                PNG_CHUNK_FCTL,
+                createFrameControlData(
+                    sequenceNumber = 0,
+                    width = bitmap.width,
+                    height = bitmap.height,
+                    delayMillis = PRIVACY_NOISE_FRAME_DELAY_MILLIS,
+                ),
+            )
+            writePngChunk(PNG_CHUNK_IDAT, compressNoiseFrame(bitmap.width, bitmap.height))
+            writePngChunk(
+                PNG_CHUNK_FCTL,
+                createFrameControlData(
+                    sequenceNumber = 1,
+                    width = bitmap.width,
+                    height = bitmap.height,
+                    delayMillis = PRIVACY_IMAGE_FRAME_DELAY_MILLIS,
+                ),
+            )
+            writePngChunk(PNG_CHUNK_FDAT, createFrameData(sequenceNumber = 2, compressedFrame = compressBitmapFrame(bitmap)))
+            writePngChunk(PNG_CHUNK_IEND, ByteArray(0))
+        }
+    }
+
+    private fun createIhdrData(width: Int, height: Int): ByteArray {
+        return buildPngData {
+            writeInt(width)
+            writeInt(height)
+            writeByte(PNG_BIT_DEPTH)
+            writeByte(PNG_COLOR_TYPE_RGBA)
+            writeByte(PNG_COMPRESSION_DEFLATE)
+            writeByte(PNG_FILTER_ADAPTIVE)
+            writeByte(PNG_INTERLACE_NONE)
+        }
+    }
+
+    private fun createAnimationControlData(): ByteArray {
+        return buildPngData {
+            writeInt(PRIVACY_APNG_FRAME_COUNT)
+            writeInt(PRIVACY_APNG_PLAY_ONCE)
+        }
+    }
+
+    private fun createFrameControlData(sequenceNumber: Int, width: Int, height: Int, delayMillis: Int): ByteArray {
+        return buildPngData {
+            writeInt(sequenceNumber)
+            writeInt(width)
+            writeInt(height)
+            writeInt(0)
+            writeInt(0)
+            writeShort(delayMillis)
+            writeShort(APNG_DELAY_DENOMINATOR)
+            writeByte(APNG_DISPOSE_NONE)
+            writeByte(APNG_BLEND_SOURCE)
+        }
+    }
+
+    private fun createFrameData(sequenceNumber: Int, compressedFrame: ByteArray): ByteArray {
+        return buildPngData {
+            writeInt(sequenceNumber)
+            write(compressedFrame)
+        }
+    }
+
+    private fun compressNoiseFrame(width: Int, height: Int): ByteArray {
+        val tileColors = IntArray((width + PRIVACY_NOISE_TILE_SIZE - 1) / PRIVACY_NOISE_TILE_SIZE)
+        return compressRgbaRows(width, height) { y, rowBuffer ->
+            if (y % PRIVACY_NOISE_TILE_SIZE == 0) {
+                for (index in tileColors.indices) {
+                    tileColors[index] = 0xFF000000.toInt() or noiseRandom.nextInt(0x1000000)
+                }
+            }
+            rowBuffer.writePngFilterByte()
+            var offset = 1
+            for (x in 0 until width) {
+                val color = tileColors[x / PRIVACY_NOISE_TILE_SIZE]
+                rowBuffer[offset++] = ((color shr 16) and 0xFF).toByte()
+                rowBuffer[offset++] = ((color shr 8) and 0xFF).toByte()
+                rowBuffer[offset++] = (color and 0xFF).toByte()
+                rowBuffer[offset++] = 0xFF.toByte()
+            }
+        }
+    }
+
+    private fun compressBitmapFrame(bitmap: Bitmap): ByteArray {
+        val pixels = IntArray(bitmap.width)
+        return compressRgbaRows(bitmap.width, bitmap.height) { y, rowBuffer ->
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, y, bitmap.width, 1)
+            rowBuffer.writePngFilterByte()
+            var offset = 1
+            for (pixel in pixels) {
+                rowBuffer[offset++] = ((pixel shr 16) and 0xFF).toByte()
+                rowBuffer[offset++] = ((pixel shr 8) and 0xFF).toByte()
+                rowBuffer[offset++] = (pixel and 0xFF).toByte()
+                rowBuffer[offset++] = ((pixel ushr 24) and 0xFF).toByte()
+            }
+        }
+    }
+
+    private fun compressRgbaRows(width: Int, height: Int, writeRow: (Int, ByteArray) -> Unit): ByteArray {
+        val compressedOutput = ByteArrayOutputStream()
+        DeflaterOutputStream(compressedOutput).use { deflaterOutput ->
+            val rowBuffer = ByteArray(width * PNG_RGBA_BYTES_PER_PIXEL + 1)
+            for (y in 0 until height) {
+                writeRow(y, rowBuffer)
+                deflaterOutput.write(rowBuffer)
+            }
+        }
+        return compressedOutput.toByteArray()
+    }
+
+    private fun ByteArray.writePngFilterByte() {
+        this[0] = PNG_FILTER_NONE.toByte()
+    }
+
+    private fun buildPngData(writeData: DataOutputStream.() -> Unit): ByteArray {
+        val output = ByteArrayOutputStream()
+        DataOutputStream(output).use { dataOutput -> dataOutput.writeData() }
+        return output.toByteArray()
+    }
+
+    private fun DataOutputStream.writePngChunk(type: ByteArray, data: ByteArray) {
+        writeInt(data.size)
+        write(type)
+        write(data)
+        writeInt(crcFor(type, data).toInt())
+    }
+
+    private fun crcFor(type: ByteArray, data: ByteArray): Long {
+        return CRC32().apply {
+            update(type)
+            update(data)
+        }.value
     }
 
     private fun copyUriToFile(uri: Uri, outputFile: File) {
@@ -341,17 +500,6 @@ class ShareActivity : Activity() {
         finish()
     }
 
-    private fun exifTimestamp(): String = SimpleDateFormat(EXIF_TIMESTAMP_PATTERN, Locale.US).format(Date())
-
-    private fun imageExtensionFor(mimeType: String): String? {
-        return when (mimeType.lowercase(Locale.US)) {
-            IMAGE_JPEG_MIME_TYPE -> "jpg"
-            IMAGE_PNG_MIME_TYPE -> "png"
-            IMAGE_WEBP_MIME_TYPE -> "webp"
-            else -> null
-        }
-    }
-
     private fun videoExtensionFor(mimeType: String): String {
         return when (mimeType.lowercase(Locale.US)) {
             VIDEO_MP4_MIME_TYPE -> "mp4"
@@ -373,16 +521,36 @@ class ShareActivity : Activity() {
         const val SHARED_CACHE_DIRECTORY = "shared"
         const val CACHE_BATCH_MAX_AGE_MILLIS = 2L * 24L * 60L * 60L * 1000L
         const val DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024
-        const val JPEG_QUALITY = 95
-        const val EXIF_TIMESTAMP_PATTERN = "yyyy:MM:dd HH:mm:ss"
         const val IMAGE_MIME_PREFIX = "image/"
         const val VIDEO_MIME_PREFIX = "video/"
-        const val IMAGE_JPEG_MIME_TYPE = "image/jpeg"
         const val IMAGE_PNG_MIME_TYPE = "image/png"
-        const val IMAGE_WEBP_MIME_TYPE = "image/webp"
         const val VIDEO_MP4_MIME_TYPE = "video/mp4"
         const val VIDEO_QUICKTIME_MIME_TYPE = "video/quicktime"
         const val VIDEO_WEBM_MIME_TYPE = "video/webm"
         const val EXPORT_METADATA_MIME_TYPE = "application/sharehelper-export"
+        const val PRIVACY_APNG_FRAME_COUNT = 2
+        const val PRIVACY_APNG_PLAY_ONCE = 1
+        const val PRIVACY_NOISE_FRAME_DELAY_MILLIS = 350
+        const val PRIVACY_IMAGE_FRAME_DELAY_MILLIS = 1000
+        const val PRIVACY_NOISE_TILE_SIZE = 12
+        const val PNG_BIT_DEPTH = 8
+        const val PNG_COLOR_TYPE_RGBA = 6
+        const val PNG_COMPRESSION_DEFLATE = 0
+        const val PNG_FILTER_ADAPTIVE = 0
+        const val PNG_FILTER_NONE = 0
+        const val PNG_INTERLACE_NONE = 0
+        const val PNG_RGBA_BYTES_PER_PIXEL = 4
+        const val APNG_DELAY_DENOMINATOR = 1000
+        const val APNG_DISPOSE_NONE = 0
+        const val APNG_BLEND_SOURCE = 0
+
+        val PNG_SIGNATURE = byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
+        val PNG_CHUNK_IHDR = byteArrayOf(73, 72, 68, 82)
+        val PNG_CHUNK_ACTL = byteArrayOf(97, 99, 84, 76)
+        val PNG_CHUNK_FCTL = byteArrayOf(102, 99, 84, 76)
+        val PNG_CHUNK_IDAT = byteArrayOf(73, 68, 65, 84)
+        val PNG_CHUNK_FDAT = byteArrayOf(102, 100, 65, 84)
+        val PNG_CHUNK_IEND = byteArrayOf(73, 69, 78, 68)
+        val noiseRandom = SecureRandom()
     }
 }
