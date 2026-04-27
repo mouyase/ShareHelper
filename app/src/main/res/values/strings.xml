@@ -2,6 +2,7 @@
     <string name="app_name">分享助手</string>
     <string name="no_media_message">没有找到可处理的图片或视频</string>
     <string name="processing_failed_message">处理分享内容失败</string>
+    <string name="image_too_large_message">图片分辨率过大，无法安全生成保密动图</string>
     <string name="no_share_target_message">没有可接收分享的应用</string>
     <string name="share_chooser_title">分享处理后的媒体</string>
     <string name="share_clip_label">分享助手导出内容</string>

@@ -29,7 +29,7 @@ import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
 import java.util.zip.CRC32
-import java.util.zip.DeflaterOutputStream
+import java.util.zip.Deflater
 import kotlin.math.max
 
 class ShareActivity : Activity() {
@@ -48,8 +48,13 @@ class ShareActivity : Activity() {
                             shareProcessedMedia(processedMedia)
                         }
                     },
-                    onFailure = {
-                        showToastAndFinish(getString(R.string.processing_failed_message))
+                    onFailure = { exception ->
+                        val message = if (exception is ImageTooLargeException) {
+                            getString(R.string.image_too_large_message)
+                        } else {
+                            getString(R.string.processing_failed_message)
+                        }
+                        showToastAndFinish(message)
                     },
                 )
             }
@@ -240,7 +245,20 @@ class ShareActivity : Activity() {
     }
 
     private fun decodeOrientedBitmap(uri: Uri): Bitmap {
-        val bitmap = contentResolver.openInputStream(uri)?.use(BitmapFactory::decodeStream)
+        val imageBounds = decodeImageBounds(uri)
+        if (imageBounds.width <= 0 || imageBounds.height <= 0) throw IOException("Unable to decode image bounds")
+
+        val sampleSize = calculateSampleSize(imageBounds.width, imageBounds.height)
+        val bitmap = contentResolver.openInputStream(uri)?.use { inputStream ->
+            BitmapFactory.decodeStream(
+                inputStream,
+                null,
+                BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                },
+            )
+        }
             ?: throw IOException("Unable to decode image")
         val orientation = readExifOrientation(uri)
         val orientationMatrix = orientation.toBitmapMatrix()
@@ -253,6 +271,27 @@ class ShareActivity : Activity() {
         }.also { orientedBitmap ->
             if (orientedBitmap !== bitmap) bitmap.recycle()
         }
+    }
+
+    private fun decodeImageBounds(uri: Uri): ImageBounds {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { inputStream -> BitmapFactory.decodeStream(inputStream, null, options) }
+        return ImageBounds(options.outWidth, options.outHeight)
+    }
+
+    private fun calculateSampleSize(width: Int, height: Int): Int {
+        var sampleSize = 1
+        while (
+            width / sampleSize > PRIVACY_IMAGE_MAX_DIMENSION ||
+            height / sampleSize > PRIVACY_IMAGE_MAX_DIMENSION ||
+            (width.toLong() / sampleSize) * (height.toLong() / sampleSize) > PRIVACY_IMAGE_MAX_PIXELS
+        ) {
+            sampleSize *= 2
+        }
+        val sampledWidth = width / sampleSize
+        val sampledHeight = height / sampleSize
+        if (sampledWidth <= 0 || sampledHeight <= 0) throw ImageTooLargeException()
+        return sampleSize
     }
 
     private fun readExifOrientation(uri: Uri): Int {
@@ -308,7 +347,9 @@ class ShareActivity : Activity() {
                     delayMillis = PRIVACY_NOISE_FRAME_DELAY_MILLIS,
                 ),
             )
-            writePngChunk(PNG_CHUNK_IDAT, compressNoiseFrame(bitmap.width, bitmap.height))
+            writeCompressedPngChunk(PNG_CHUNK_IDAT) { chunkedOutput ->
+                writeNoiseRows(bitmap.width, bitmap.height, chunkedOutput)
+            }
             writePngChunk(
                 PNG_CHUNK_FCTL,
                 createFrameControlData(
@@ -318,7 +359,9 @@ class ShareActivity : Activity() {
                     delayMillis = PRIVACY_IMAGE_FRAME_DELAY_MILLIS,
                 ),
             )
-            writePngChunk(PNG_CHUNK_FDAT, createFrameData(sequenceNumber = 2, compressedFrame = compressBitmapFrame(bitmap)))
+            writeCompressedFrameData(sequenceNumber = 2) { chunkedOutput ->
+                writeBitmapRows(bitmap, chunkedOutput)
+            }
             writePngChunk(PNG_CHUNK_IEND, ByteArray(0))
         }
     }
@@ -356,16 +399,9 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun createFrameData(sequenceNumber: Int, compressedFrame: ByteArray): ByteArray {
-        return buildPngData {
-            writeInt(sequenceNumber)
-            write(compressedFrame)
-        }
-    }
-
-    private fun compressNoiseFrame(width: Int, height: Int): ByteArray {
+    private fun writeNoiseRows(width: Int, height: Int, outputStream: OutputStream) {
         val tileColors = IntArray((width + PRIVACY_NOISE_TILE_SIZE - 1) / PRIVACY_NOISE_TILE_SIZE)
-        return compressRgbaRows(width, height) { y, rowBuffer ->
+        writeRgbaRows(width, height, outputStream) { y, rowBuffer ->
             if (y % PRIVACY_NOISE_TILE_SIZE == 0) {
                 for (index in tileColors.indices) {
                     tileColors[index] = 0xFF000000.toInt() or noiseRandom.nextInt(0x1000000)
@@ -383,9 +419,9 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun compressBitmapFrame(bitmap: Bitmap): ByteArray {
+    private fun writeBitmapRows(bitmap: Bitmap, outputStream: OutputStream) {
         val pixels = IntArray(bitmap.width)
-        return compressRgbaRows(bitmap.width, bitmap.height) { y, rowBuffer ->
+        writeRgbaRows(bitmap.width, bitmap.height, outputStream) { y, rowBuffer ->
             bitmap.getPixels(pixels, 0, bitmap.width, 0, y, bitmap.width, 1)
             rowBuffer.writePngFilterByte()
             var offset = 1
@@ -398,16 +434,12 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun compressRgbaRows(width: Int, height: Int, writeRow: (Int, ByteArray) -> Unit): ByteArray {
-        val compressedOutput = ByteArrayOutputStream()
-        DeflaterOutputStream(compressedOutput).use { deflaterOutput ->
-            val rowBuffer = ByteArray(width * PNG_RGBA_BYTES_PER_PIXEL + 1)
-            for (y in 0 until height) {
-                writeRow(y, rowBuffer)
-                deflaterOutput.write(rowBuffer)
-            }
+    private fun writeRgbaRows(width: Int, height: Int, outputStream: OutputStream, writeRow: (Int, ByteArray) -> Unit) {
+        val rowBuffer = ByteArray(width * PNG_RGBA_BYTES_PER_PIXEL + 1)
+        for (y in 0 until height) {
+            writeRow(y, rowBuffer)
+            outputStream.write(rowBuffer)
         }
-        return compressedOutput.toByteArray()
     }
 
     private fun ByteArray.writePngFilterByte() {
@@ -421,17 +453,25 @@ class ShareActivity : Activity() {
     }
 
     private fun DataOutputStream.writePngChunk(type: ByteArray, data: ByteArray) {
-        writeInt(data.size)
-        write(type)
-        write(data)
-        writeInt(crcFor(type, data).toInt())
+        writePngChunkData(this, type, data)
     }
 
-    private fun crcFor(type: ByteArray, data: ByteArray): Long {
-        return CRC32().apply {
-            update(type)
-            update(data)
-        }.value
+    private fun DataOutputStream.writeCompressedPngChunk(type: ByteArray, writeRows: (OutputStream) -> Unit) {
+        val chunkedOutput = ChunkedDeflaterPngOutput(this, type)
+        try {
+            writeRows(chunkedOutput)
+        } finally {
+            chunkedOutput.finish()
+        }
+    }
+
+    private fun DataOutputStream.writeCompressedFrameData(sequenceNumber: Int, writeRows: (OutputStream) -> Unit) {
+        val chunkedOutput = ChunkedDeflaterApngFrameOutput(this, sequenceNumber)
+        try {
+            writeRows(chunkedOutput)
+        } finally {
+            chunkedOutput.finish()
+        }
     }
 
     private fun copyUriToFile(uri: Uri, outputFile: File) {
@@ -515,9 +555,93 @@ class ShareActivity : Activity() {
 
     private data class InputMedia(val uri: Uri, val mimeType: String)
 
+    private data class ImageBounds(val width: Int, val height: Int)
+
     private data class ProcessedMedia(val uri: Uri, val mimeType: String)
 
+    private class ImageTooLargeException : IOException("Image is too large for privacy animation")
+
+    private open class ChunkedDeflaterPngOutput(
+        private val destination: DataOutputStream,
+        private val chunkType: ByteArray,
+    ) : OutputStream() {
+        private val deflater = Deflater(Deflater.DEFAULT_COMPRESSION)
+        private val inputBuffer = ByteArray(1)
+        private val outputBuffer = ByteArray(PNG_STREAM_CHUNK_SIZE)
+        private var finished = false
+
+        override fun write(b: Int) {
+            inputBuffer[0] = b.toByte()
+            write(inputBuffer, 0, 1)
+        }
+
+        override fun write(buffer: ByteArray, offset: Int, count: Int) {
+            deflater.setInput(buffer, offset, count)
+            drainDeflaterUntilInputNeeded()
+        }
+
+        fun finish() {
+            if (finished) return
+            deflater.finish()
+            drainDeflaterUntilFinished()
+            deflater.end()
+            finished = true
+        }
+
+        protected open fun writeCompressedChunk(compressedBytes: ByteArray, size: Int) {
+            writePngChunkData(destination, chunkType, compressedBytes.copyOf(size))
+        }
+
+        private fun drainDeflaterUntilInputNeeded() {
+            while (!deflater.needsInput()) {
+                val size = deflater.deflate(outputBuffer)
+                if (size > 0) {
+                    writeCompressedChunk(outputBuffer, size)
+                } else {
+                    break
+                }
+            }
+        }
+
+        private fun drainDeflaterUntilFinished() {
+            while (!deflater.finished()) {
+                val size = deflater.deflate(outputBuffer)
+                if (size > 0) {
+                    writeCompressedChunk(outputBuffer, size)
+                } else if (deflater.needsInput()) {
+                    break
+                }
+            }
+        }
+    }
+
+    private class ChunkedDeflaterApngFrameOutput(
+        destination: DataOutputStream,
+        private var sequenceNumber: Int,
+    ) : ChunkedDeflaterPngOutput(destination, PNG_CHUNK_FDAT) {
+        override fun writeCompressedChunk(compressedBytes: ByteArray, size: Int) {
+            val frameData = ByteArray(size + APNG_SEQUENCE_NUMBER_SIZE)
+            ByteBuffer.wrap(frameData).putInt(sequenceNumber).put(compressedBytes, 0, size)
+            super.writeCompressedChunk(frameData, frameData.size)
+            sequenceNumber += 1
+        }
+    }
+
     private companion object {
+        fun writePngChunkData(destination: DataOutputStream, type: ByteArray, data: ByteArray) {
+            destination.writeInt(data.size)
+            destination.write(type)
+            destination.write(data)
+            destination.writeInt(crcFor(type, data).toInt())
+        }
+
+        fun crcFor(type: ByteArray, data: ByteArray): Long {
+            return CRC32().apply {
+                update(type)
+                update(data)
+            }.value
+        }
+
         const val SHARED_CACHE_DIRECTORY = "shared"
         const val CACHE_BATCH_MAX_AGE_MILLIS = 2L * 24L * 60L * 60L * 1000L
         const val DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024
@@ -533,6 +657,8 @@ class ShareActivity : Activity() {
         const val PRIVACY_NOISE_FRAME_DELAY_MILLIS = 350
         const val PRIVACY_IMAGE_FRAME_DELAY_MILLIS = 1000
         const val PRIVACY_NOISE_TILE_SIZE = 12
+        const val PRIVACY_IMAGE_MAX_DIMENSION = 4096
+        const val PRIVACY_IMAGE_MAX_PIXELS = 12_000_000L
         const val PNG_BIT_DEPTH = 8
         const val PNG_COLOR_TYPE_RGBA = 6
         const val PNG_COMPRESSION_DEFLATE = 0
@@ -543,6 +669,8 @@ class ShareActivity : Activity() {
         const val APNG_DELAY_DENOMINATOR = 1000
         const val APNG_DISPOSE_NONE = 0
         const val APNG_BLEND_SOURCE = 0
+        const val APNG_SEQUENCE_NUMBER_SIZE = 4
+        const val PNG_STREAM_CHUNK_SIZE = 64 * 1024
 
         val PNG_SIGNATURE = byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
         val PNG_CHUNK_IHDR = byteArrayOf(73, 72, 68, 82)
