@@ -4,8 +4,10 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Matrix
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -14,6 +16,14 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Base64
+import android.util.Base64OutputStream
+import android.view.Gravity
+import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
@@ -21,11 +31,11 @@ import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.nio.ByteBuffer
-import java.security.SecureRandom
 import java.util.Locale
 import java.util.UUID
 import java.util.zip.CRC32
@@ -35,6 +45,7 @@ import kotlin.math.max
 class ShareActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        showLoadingView()
         cleanupOldBatches()
 
         Thread {
@@ -49,16 +60,52 @@ class ShareActivity : Activity() {
                         }
                     },
                     onFailure = { exception ->
-                        val message = if (exception is ImageTooLargeException) {
-                            getString(R.string.image_too_large_message)
-                        } else {
-                            getString(R.string.processing_failed_message)
+                        val message = when (exception) {
+                            is ImageTooLargeException -> getString(R.string.image_too_large_message)
+                            is InsufficientVideoCacheSpaceException -> getString(R.string.video_cache_space_message)
+                            is UnsupportedVideoMimeTypeException -> getString(R.string.unsupported_video_type_message)
+                            else -> getString(R.string.processing_failed_message)
                         }
                         showToastAndFinish(message)
                     },
                 )
             }
         }.start()
+    }
+
+    private fun showLoadingView() {
+        val density = resources.displayMetrics.density
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.WHITE)
+            setPadding(
+                (LOADING_HORIZONTAL_PADDING_DP * density).toInt(),
+                (LOADING_VERTICAL_PADDING_DP * density).toInt(),
+                (LOADING_HORIZONTAL_PADDING_DP * density).toInt(),
+                (LOADING_VERTICAL_PADDING_DP * density).toInt(),
+            )
+        }
+
+        val messageView = TextView(this).apply {
+            text = getString(R.string.loading_message)
+            gravity = Gravity.CENTER
+            textSize = LOADING_TEXT_SIZE_SP
+            setTextColor(Color.rgb(32, 32, 32))
+        }
+
+        container.addView(
+            ProgressBar(this).apply { isIndeterminate = true },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
+        container.addView(
+            messageView,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = (LOADING_TEXT_TOP_MARGIN_DP * density).toInt()
+            },
+        )
+
+        setContentView(container)
     }
 
     private fun processIntent(sourceIntent: Intent): List<ProcessedMedia> {
@@ -73,9 +120,10 @@ class ShareActivity : Activity() {
 
         return inputs.mapIndexed { index, input ->
             val exportID = "${batchID}_export_${index}_${UUID.randomUUID()}"
+            val fileID = UUID.randomUUID().toString()
             when {
-                input.mimeType.startsWith(IMAGE_MIME_PREFIX) -> processImage(input.uri, batchDirectory, index, exportID)
-                input.mimeType.startsWith(VIDEO_MIME_PREFIX) -> processVideo(input.uri, input.mimeType, batchDirectory, index, exportID)
+                input.mimeType.startsWith(IMAGE_MIME_PREFIX) -> processImage(input.uri, batchDirectory, fileID, exportID)
+                input.mimeType.startsWith(VIDEO_MIME_PREFIX) -> processVideo(input.uri, input.mimeType.requireConcreteVideoMimeType(), batchDirectory, fileID, exportID)
                 else -> throw IOException("Unsupported media type")
             }
         }
@@ -109,26 +157,62 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun processImage(uri: Uri, batchDirectory: File, index: Int, exportID: String): ProcessedMedia {
-        val animatedFile = File(batchDirectory, "image_${index}_${exportID}_privacy.png")
-        encodePrivacyApng(uri, animatedFile)
-        return animatedFile.toProcessedMedia(IMAGE_PNG_MIME_TYPE)
+    private fun processImage(uri: Uri, batchDirectory: File, fileID: String, exportID: String): ProcessedMedia {
+        val htmlFile = File(batchDirectory, "$fileID.html")
+        try {
+            writeImageHtml(uri, htmlFile, exportID)
+        } catch (exception: IOException) {
+            htmlFile.delete()
+            throw exception
+        } catch (exception: RuntimeException) {
+            htmlFile.delete()
+            throw exception
+        }
+        return htmlFile.toProcessedMedia(TEXT_HTML_MIME_TYPE)
     }
 
-    private fun processVideo(uri: Uri, mimeType: String, batchDirectory: File, index: Int, exportID: String): ProcessedMedia {
+    private fun processVideo(uri: Uri, mimeType: String, batchDirectory: File, fileID: String, exportID: String): ProcessedMedia {
+        validateVideoSize(uri, batchDirectory)
+        var videoFile: File? = null
+        var htmlFile: File? = null
         if (mimeType == VIDEO_MP4_MIME_TYPE) {
-            val remuxedFile = File(batchDirectory, "video_${index}_${exportID}.mp4")
+            val remuxedFile = File(batchDirectory, "${fileID}_source.mp4")
             if (remuxMp4WithMetadataTrack(uri, remuxedFile, exportID)) {
-                return remuxedFile.toProcessedMedia(VIDEO_MP4_MIME_TYPE)
+                videoFile = remuxedFile
+                htmlFile = File(batchDirectory, "$fileID.html")
+                return try {
+                    writeVideoHtml(remuxedFile, VIDEO_MP4_MIME_TYPE, htmlFile)
+                    htmlFile.toProcessedMedia(TEXT_HTML_MIME_TYPE)
+                } catch (exception: IOException) {
+                    htmlFile.delete()
+                    videoFile.delete()
+                    throw exception
+                } catch (exception: RuntimeException) {
+                    htmlFile.delete()
+                    videoFile.delete()
+                    throw exception
+                }
             }
             remuxedFile.delete()
         }
 
-        val copiedFile = File(batchDirectory, "video_${index}_${exportID}.${videoExtensionFor(mimeType)}")
+        videoFile = File(batchDirectory, "${fileID}_source.${videoExtensionFor(mimeType)}")
+        htmlFile = File(batchDirectory, "$fileID.html")
         // TODO: Replace this conservative fallback with a Media3 Transformer remux path for non-MP4
         // inputs and platform/device cases where MediaMuxer rejects an MP4 metadata track.
-        copyUriToFile(uri, copiedFile)
-        return copiedFile.toProcessedMedia(mimeType)
+        return try {
+            copyUriToFile(uri, videoFile, batchDirectory)
+            writeVideoHtml(videoFile, mimeType, htmlFile)
+            htmlFile.toProcessedMedia(TEXT_HTML_MIME_TYPE)
+        } catch (exception: IOException) {
+            htmlFile.delete()
+            videoFile.delete()
+            throw exception
+        } catch (exception: RuntimeException) {
+            htmlFile.delete()
+            videoFile.delete()
+            throw exception
+        }
     }
 
     private fun remuxMp4WithMetadataTrack(uri: Uri, outputFile: File, exportID: String): Boolean {
@@ -147,7 +231,7 @@ class ShareActivity : Activity() {
                 val format = extractor.getTrackFormat(trackIndex)
                 trackMappings[trackIndex] = muxer.addTrack(format)
                 if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                    maxInputSize = max(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    maxInputSize = max(maxInputSize, format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtMost(MAX_VIDEO_SAMPLE_BUFFER_SIZE))
                 }
                 extractor.selectTrack(trackIndex)
             }
@@ -233,14 +317,50 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun encodePrivacyApng(uri: Uri, outputFile: File) {
+    private fun writeImageHtml(uri: Uri, outputFile: File, exportID: String) {
         val bitmap = decodeOrientedBitmap(uri)
         try {
             FileOutputStream(outputFile).use { outputStream ->
-                writePrivacyApng(bitmap, outputStream)
+                outputStream.write("<!doctype html>\n".toByteArray(Charsets.UTF_8))
+                outputStream.write("<html lang=\"zh-CN\">\n".toByteArray(Charsets.UTF_8))
+                outputStream.write("<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>".toByteArray(Charsets.UTF_8))
+                val title = getString(R.string.image_html_title).toHtmlAttributeText()
+                outputStream.write(title.toByteArray(Charsets.UTF_8))
+                outputStream.write("</title></head>\n".toByteArray(Charsets.UTF_8))
+                outputStream.write("<body style=\"margin:0;background:#fff;color:#111;font-family:sans-serif;\">\n".toByteArray(Charsets.UTF_8))
+                outputStream.write("<img style=\"display:block;width:100%;height:auto;\" alt=\"".toByteArray(Charsets.UTF_8))
+                outputStream.write(title.toByteArray(Charsets.UTF_8))
+                outputStream.write("\" src=\"data:".toByteArray(Charsets.UTF_8))
+                outputStream.write(IMAGE_PNG_MIME_TYPE.toByteArray(Charsets.UTF_8))
+                outputStream.write(";base64,".toByteArray(Charsets.UTF_8))
+                Base64OutputStream(outputStream, Base64.NO_WRAP or Base64.NO_CLOSE).use { base64OutputStream ->
+                    writeImagePng(bitmap, base64OutputStream, exportID)
+                }
+                outputStream.write("\">\n</body>\n</html>\n".toByteArray(Charsets.UTF_8))
             }
         } finally {
             bitmap.recycle()
+        }
+    }
+
+    private fun writeVideoHtml(videoFile: File, videoMimeType: String, outputFile: File) {
+        validateVideoHtmlBudget(videoFile, outputFile)
+        FileOutputStream(outputFile).use { outputStream ->
+            outputStream.write("<!doctype html>\n".toByteArray(Charsets.UTF_8))
+            outputStream.write("<html lang=\"zh-CN\">\n".toByteArray(Charsets.UTF_8))
+            outputStream.write("<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>".toByteArray(Charsets.UTF_8))
+            outputStream.write(getString(R.string.video_html_title).toHtmlAttributeText().toByteArray(Charsets.UTF_8))
+            outputStream.write("</title></head>\n".toByteArray(Charsets.UTF_8))
+            outputStream.write("<body style=\"margin:0;background:#fff;color:#111;font-family:sans-serif;\">\n".toByteArray(Charsets.UTF_8))
+            outputStream.write("<video controls style=\"display:block;width:100%;max-height:100vh;\" src=\"data:".toByteArray(Charsets.UTF_8))
+            outputStream.write(videoMimeType.toHtmlAttributeText().toByteArray(Charsets.UTF_8))
+            outputStream.write(";base64,".toByteArray(Charsets.UTF_8))
+            Base64OutputStream(outputStream, Base64.NO_WRAP or Base64.NO_CLOSE).use { base64OutputStream ->
+                FileInputStream(videoFile).use { inputStream ->
+                    inputStream.copyTo(base64OutputStream, DEFAULT_VIDEO_BUFFER_SIZE)
+                }
+            }
+            outputStream.write("\"></video>\n</body>\n</html>\n".toByteArray(Charsets.UTF_8))
         }
     }
 
@@ -331,38 +451,24 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun writePrivacyApng(bitmap: Bitmap, outputStream: OutputStream) {
+    private fun writeImagePng(bitmap: Bitmap, outputStream: OutputStream, exportID: String) {
         if (bitmap.width <= 0 || bitmap.height <= 0) throw IOException("Unable to encode empty image")
-
         DataOutputStream(outputStream).apply {
             write(PNG_SIGNATURE)
             writePngChunk(PNG_CHUNK_IHDR, createIhdrData(bitmap.width, bitmap.height))
-            writePngChunk(PNG_CHUNK_ACTL, createAnimationControlData())
-            writePngChunk(
-                PNG_CHUNK_FCTL,
-                createFrameControlData(
-                    sequenceNumber = 0,
-                    width = bitmap.width,
-                    height = bitmap.height,
-                    delayMillis = PRIVACY_NOISE_FRAME_DELAY_MILLIS,
-                ),
-            )
+            writePngChunk(PNG_CHUNK_TEXT, createTextChunkData(PNG_TEXT_KEYWORD_EXPORT_ID, exportID))
             writeCompressedPngChunk(PNG_CHUNK_IDAT) { chunkedOutput ->
-                writeNoiseRows(bitmap.width, bitmap.height, chunkedOutput)
-            }
-            writePngChunk(
-                PNG_CHUNK_FCTL,
-                createFrameControlData(
-                    sequenceNumber = 1,
-                    width = bitmap.width,
-                    height = bitmap.height,
-                    delayMillis = PRIVACY_IMAGE_FRAME_DELAY_MILLIS,
-                ),
-            )
-            writeCompressedFrameData(sequenceNumber = 2) { chunkedOutput ->
-                writeBitmapRows(bitmap, chunkedOutput)
+                writeOriginalRows(bitmap, chunkedOutput)
             }
             writePngChunk(PNG_CHUNK_IEND, ByteArray(0))
+        }
+    }
+
+    private fun createTextChunkData(keyword: String, text: String): ByteArray {
+        return buildPngData {
+            write(keyword.toByteArray(Charsets.ISO_8859_1))
+            writeByte(0)
+            write(text.toByteArray(Charsets.ISO_8859_1))
         }
     }
 
@@ -378,48 +484,7 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun createAnimationControlData(): ByteArray {
-        return buildPngData {
-            writeInt(PRIVACY_APNG_FRAME_COUNT)
-            writeInt(PRIVACY_APNG_PLAY_ONCE)
-        }
-    }
-
-    private fun createFrameControlData(sequenceNumber: Int, width: Int, height: Int, delayMillis: Int): ByteArray {
-        return buildPngData {
-            writeInt(sequenceNumber)
-            writeInt(width)
-            writeInt(height)
-            writeInt(0)
-            writeInt(0)
-            writeShort(delayMillis)
-            writeShort(APNG_DELAY_DENOMINATOR)
-            writeByte(APNG_DISPOSE_NONE)
-            writeByte(APNG_BLEND_SOURCE)
-        }
-    }
-
-    private fun writeNoiseRows(width: Int, height: Int, outputStream: OutputStream) {
-        val tileColors = IntArray((width + PRIVACY_NOISE_TILE_SIZE - 1) / PRIVACY_NOISE_TILE_SIZE)
-        writeRgbaRows(width, height, outputStream) { y, rowBuffer ->
-            if (y % PRIVACY_NOISE_TILE_SIZE == 0) {
-                for (index in tileColors.indices) {
-                    tileColors[index] = 0xFF000000.toInt() or noiseRandom.nextInt(0x1000000)
-                }
-            }
-            rowBuffer.writePngFilterByte()
-            var offset = 1
-            for (x in 0 until width) {
-                val color = tileColors[x / PRIVACY_NOISE_TILE_SIZE]
-                rowBuffer[offset++] = ((color shr 16) and 0xFF).toByte()
-                rowBuffer[offset++] = ((color shr 8) and 0xFF).toByte()
-                rowBuffer[offset++] = (color and 0xFF).toByte()
-                rowBuffer[offset++] = 0xFF.toByte()
-            }
-        }
-    }
-
-    private fun writeBitmapRows(bitmap: Bitmap, outputStream: OutputStream) {
+    private fun writeOriginalRows(bitmap: Bitmap, outputStream: OutputStream) {
         val pixels = IntArray(bitmap.width)
         writeRgbaRows(bitmap.width, bitmap.height, outputStream) { y, rowBuffer ->
             bitmap.getPixels(pixels, 0, bitmap.width, 0, y, bitmap.width, 1)
@@ -465,21 +530,60 @@ class ShareActivity : Activity() {
         }
     }
 
-    private fun DataOutputStream.writeCompressedFrameData(sequenceNumber: Int, writeRows: (OutputStream) -> Unit) {
-        val chunkedOutput = ChunkedDeflaterApngFrameOutput(this, sequenceNumber)
-        try {
-            writeRows(chunkedOutput)
-        } finally {
-            chunkedOutput.finish()
+    private fun copyUriToFile(uri: Uri, outputFile: File, batchDirectory: File) {
+        contentResolver.openInputStream(uri)?.use { inputStream ->
+            FileOutputStream(outputFile).use { outputStream ->
+                val buffer = ByteArray(DEFAULT_VIDEO_BUFFER_SIZE)
+                var copiedBytes = 0L
+                while (true) {
+                    val read = inputStream.read(buffer)
+                    if (read < 0) break
+                    copiedBytes += read.toLong()
+                    if (estimatedBase64HtmlBytes(copiedBytes) > batchDirectory.usableSpace) throw InsufficientVideoCacheSpaceException()
+                    outputStream.write(buffer, 0, read)
+                }
+            }
+        } ?: throw IOException("Unable to open shared media")
+    }
+
+    private fun validateVideoSize(uri: Uri, batchDirectory: File) {
+        val inputSize = queryContentSize(uri)
+        if (inputSize > 0 && estimatedVideoCacheBytes(inputSize) > batchDirectory.usableSpace) {
+            throw InsufficientVideoCacheSpaceException()
         }
     }
 
-    private fun copyUriToFile(uri: Uri, outputFile: File) {
-        contentResolver.openInputStream(uri)?.use { inputStream ->
-            FileOutputStream(outputFile).use { outputStream ->
-                inputStream.copyTo(outputStream)
-            }
-        } ?: throw IOException("Unable to open shared media")
+    private fun validateVideoHtmlBudget(videoFile: File, outputFile: File) {
+        val videoSize = videoFile.length()
+        val estimatedHtmlSize = estimatedBase64HtmlBytes(videoSize)
+        val outputDirectory = outputFile.parentFile ?: throw InsufficientVideoCacheSpaceException()
+        if (estimatedHtmlSize > outputDirectory.usableSpace) throw InsufficientVideoCacheSpaceException()
+    }
+
+    private fun estimatedVideoCacheBytes(videoSize: Long): Long {
+        return videoSize + estimatedBase64HtmlBytes(videoSize)
+    }
+
+    private fun estimatedBase64HtmlBytes(videoSize: Long): Long {
+        return ((videoSize + 2L) / 3L) * 4L + VIDEO_HTML_TEMPLATE_OVERHEAD_BYTES
+    }
+
+    private fun queryContentSize(uri: Uri): Long {
+        val assetLength = runCatching {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { descriptor -> descriptor.length } ?: -1L
+        }.getOrDefault(-1L)
+        if (assetLength > 0) return assetLength
+
+        return contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            cursor.contentSizeColumnValue()
+        } ?: -1L
+    }
+
+    private fun Cursor.contentSizeColumnValue(): Long {
+        if (!moveToFirst()) return -1L
+        val sizeColumnIndex = getColumnIndex(OpenableColumns.SIZE)
+        if (sizeColumnIndex < 0 || isNull(sizeColumnIndex)) return -1L
+        return getLong(sizeColumnIndex)
     }
 
     private fun File.toProcessedMedia(mimeType: String): ProcessedMedia {
@@ -516,11 +620,9 @@ class ShareActivity : Activity() {
 
     private fun outputMimeTypeFor(processedMedia: List<ProcessedMedia>): String {
         if (processedMedia.size == 1) return processedMedia.first().mimeType
-        val allImages = processedMedia.all { it.mimeType.startsWith(IMAGE_MIME_PREFIX) }
-        val allVideos = processedMedia.all { it.mimeType.startsWith(VIDEO_MIME_PREFIX) }
+        val allHtml = processedMedia.all { it.mimeType == TEXT_HTML_MIME_TYPE }
         return when {
-            allImages -> "image/*"
-            allVideos -> "video/*"
+            allHtml -> TEXT_HTML_MIME_TYPE
             else -> "*/*"
         }
     }
@@ -549,8 +651,27 @@ class ShareActivity : Activity() {
         }
     }
 
+    private fun String.requireConcreteVideoMimeType(): String {
+        if (this == VIDEO_WILDCARD_MIME_TYPE) throw UnsupportedVideoMimeTypeException()
+        return this
+    }
+
     private fun String?.isSupportedMediaMimeType(): Boolean {
-        return this != null && (startsWith(IMAGE_MIME_PREFIX) || startsWith(VIDEO_MIME_PREFIX))
+        return this != null && (startsWith(IMAGE_MIME_PREFIX) || (startsWith(VIDEO_MIME_PREFIX) && this != VIDEO_WILDCARD_MIME_TYPE))
+    }
+
+    private fun String.toHtmlAttributeText(): String {
+        return buildString(length) {
+            for (character in this@toHtmlAttributeText) {
+                when (character) {
+                    '&' -> append("&amp;")
+                    '"' -> append("&quot;")
+                    '<' -> append("&lt;")
+                    '>' -> append("&gt;")
+                    else -> append(character)
+                }
+            }
+        }
     }
 
     private data class InputMedia(val uri: Uri, val mimeType: String)
@@ -559,10 +680,14 @@ class ShareActivity : Activity() {
 
     private data class ProcessedMedia(val uri: Uri, val mimeType: String)
 
-    private class ImageTooLargeException : IOException("Image is too large for privacy animation")
+    private class ImageTooLargeException : IOException("Image is too large for HTML export")
+
+    private class InsufficientVideoCacheSpaceException : IOException("Not enough cache space for HTML video export")
+
+    private class UnsupportedVideoMimeTypeException : IOException("Video MIME type is too generic")
 
     private open class ChunkedDeflaterPngOutput(
-        private val destination: DataOutputStream,
+        protected val destination: DataOutputStream,
         private val chunkType: ByteArray,
     ) : OutputStream() {
         private val deflater = Deflater(Deflater.DEFAULT_COMPRESSION)
@@ -582,10 +707,13 @@ class ShareActivity : Activity() {
 
         fun finish() {
             if (finished) return
-            deflater.finish()
-            drainDeflaterUntilFinished()
-            deflater.end()
-            finished = true
+            try {
+                deflater.finish()
+                drainDeflaterUntilFinished()
+            } finally {
+                deflater.end()
+                finished = true
+            }
         }
 
         protected open fun writeCompressedChunk(compressedBytes: ByteArray, size: Int) {
@@ -615,18 +743,6 @@ class ShareActivity : Activity() {
         }
     }
 
-    private class ChunkedDeflaterApngFrameOutput(
-        destination: DataOutputStream,
-        private var sequenceNumber: Int,
-    ) : ChunkedDeflaterPngOutput(destination, PNG_CHUNK_FDAT) {
-        override fun writeCompressedChunk(compressedBytes: ByteArray, size: Int) {
-            val frameData = ByteArray(size + APNG_SEQUENCE_NUMBER_SIZE)
-            ByteBuffer.wrap(frameData).putInt(sequenceNumber).put(compressedBytes, 0, size)
-            super.writeCompressedChunk(frameData, frameData.size)
-            sequenceNumber += 1
-        }
-    }
-
     private companion object {
         fun writePngChunkData(destination: DataOutputStream, type: ByteArray, data: ByteArray) {
             destination.writeInt(data.size)
@@ -645,20 +761,23 @@ class ShareActivity : Activity() {
         const val SHARED_CACHE_DIRECTORY = "shared"
         const val CACHE_BATCH_MAX_AGE_MILLIS = 2L * 24L * 60L * 60L * 1000L
         const val DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024
+        const val MAX_VIDEO_SAMPLE_BUFFER_SIZE = 8 * 1024 * 1024
+        const val VIDEO_HTML_TEMPLATE_OVERHEAD_BYTES = 16L * 1024L
         const val IMAGE_MIME_PREFIX = "image/"
         const val VIDEO_MIME_PREFIX = "video/"
         const val IMAGE_PNG_MIME_TYPE = "image/png"
+        const val TEXT_HTML_MIME_TYPE = "text/html"
+        const val VIDEO_WILDCARD_MIME_TYPE = "video/*"
         const val VIDEO_MP4_MIME_TYPE = "video/mp4"
         const val VIDEO_QUICKTIME_MIME_TYPE = "video/quicktime"
         const val VIDEO_WEBM_MIME_TYPE = "video/webm"
         const val EXPORT_METADATA_MIME_TYPE = "application/sharehelper-export"
-        const val PRIVACY_APNG_FRAME_COUNT = 2
-        const val PRIVACY_APNG_PLAY_ONCE = 1
-        const val PRIVACY_NOISE_FRAME_DELAY_MILLIS = 350
-        const val PRIVACY_IMAGE_FRAME_DELAY_MILLIS = 1000
-        const val PRIVACY_NOISE_TILE_SIZE = 12
         const val PRIVACY_IMAGE_MAX_DIMENSION = 4096
-        const val PRIVACY_IMAGE_MAX_PIXELS = 12_000_000L
+        const val PRIVACY_IMAGE_MAX_PIXELS = 8_000_000L
+        const val LOADING_HORIZONTAL_PADDING_DP = 32
+        const val LOADING_VERTICAL_PADDING_DP = 24
+        const val LOADING_TEXT_TOP_MARGIN_DP = 16
+        const val LOADING_TEXT_SIZE_SP = 16f
         const val PNG_BIT_DEPTH = 8
         const val PNG_COLOR_TYPE_RGBA = 6
         const val PNG_COMPRESSION_DEFLATE = 0
@@ -666,19 +785,13 @@ class ShareActivity : Activity() {
         const val PNG_FILTER_NONE = 0
         const val PNG_INTERLACE_NONE = 0
         const val PNG_RGBA_BYTES_PER_PIXEL = 4
-        const val APNG_DELAY_DENOMINATOR = 1000
-        const val APNG_DISPOSE_NONE = 0
-        const val APNG_BLEND_SOURCE = 0
-        const val APNG_SEQUENCE_NUMBER_SIZE = 4
         const val PNG_STREAM_CHUNK_SIZE = 64 * 1024
 
         val PNG_SIGNATURE = byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10)
         val PNG_CHUNK_IHDR = byteArrayOf(73, 72, 68, 82)
-        val PNG_CHUNK_ACTL = byteArrayOf(97, 99, 84, 76)
-        val PNG_CHUNK_FCTL = byteArrayOf(102, 99, 84, 76)
         val PNG_CHUNK_IDAT = byteArrayOf(73, 68, 65, 84)
-        val PNG_CHUNK_FDAT = byteArrayOf(102, 100, 65, 84)
+        val PNG_CHUNK_TEXT = byteArrayOf(116, 69, 88, 116)
         val PNG_CHUNK_IEND = byteArrayOf(73, 69, 78, 68)
-        val noiseRandom = SecureRandom()
+        const val PNG_TEXT_KEYWORD_EXPORT_ID = "ExportID"
     }
 }

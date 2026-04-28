@@ -1,9 +1,14 @@
 <resources>
     <string name="app_name">分享助手</string>
+    <string name="loading_message">正在处理分享内容…</string>
     <string name="no_media_message">没有找到可处理的图片或视频</string>
     <string name="processing_failed_message">处理分享内容失败</string>
-    <string name="image_too_large_message">图片分辨率过大，无法安全生成保密动图</string>
+    <string name="image_too_large_message">图片分辨率过大，无法安全生成 HTML 图片文件</string>
+    <string name="video_cache_space_message">手机剩余缓存空间不足，无法生成 HTML 视频文件</string>
+    <string name="unsupported_video_type_message">视频类型不明确，无法生成 HTML 文件</string>
     <string name="no_share_target_message">没有可接收分享的应用</string>
     <string name="share_chooser_title">分享处理后的媒体</string>
     <string name="share_clip_label">分享助手导出内容</string>
+    <string name="image_html_title">分享助手图片</string>
+    <string name="video_html_title">分享助手视频</string>
 </resources>
