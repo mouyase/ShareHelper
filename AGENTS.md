@@ -43,8 +43,8 @@ ShareHelper/
 | `ShareActivity` | Activity | `ShareActivity.kt` | Receives `ACTION_SEND` / `ACTION_SEND_MULTIPLE`; processes media off main thread. |
 | `processIntent` | function | `ShareActivity.kt` | Builds batch ID, output directory, and per-item export IDs. |
 | `collectInputMedia` | function | `ShareActivity.kt` | Reads `clipData` and `EXTRA_STREAM`; de-duplicates URIs. |
-| `processImage` | function | `ShareActivity.kt` | Copies image, writes EXIF `ExportID`, or re-encodes JPEG fallback. |
-| `processVideo` | function | `ShareActivity.kt` | MP4 remux + metadata track; non-MP4 conservative copy fallback. |
+| `processImage` | function | `ShareActivity.kt` | Generates a shared HTML wrapper with an embedded base64 direction-corrected PNG data URL; the PNG preserves the `ExportID` text chunk. |
+| `processVideo` | function | `ShareActivity.kt` | Generates shared HTML wrapper with embedded base64 video data; MP4 still remuxes metadata before embedding when possible. |
 | `shareProcessedMedia` | function | `ShareActivity.kt` | Builds outgoing share intent and grants URI read permission. |
 | `SHARED_CACHE_DIRECTORY` | constant | `ShareActivity.kt` | Must stay aligned with `res/xml/file_paths.xml`. |
 
@@ -54,11 +54,11 @@ ShareHelper/
 - App name: `分享助手`; keep user-facing copy in `strings.xml`.
 - `ID` spelling is intentionally uppercase in names such as `batchID`, `exportID`, and `ExportID`.
 - Cache output only: `cacheDir/shared/batch_<timestamp>_<uuid>/`.
-- Export files include type, index, and export ID in the filename.
+- Export files use random UUID filenames; internal `ExportID` is stored in metadata, not exposed through filenames.
 - `FileProvider` authority is `${applicationId}.fileprovider`; Kotlin uses `$packageName.fileprovider`.
 - Supported input classes are images and videos; mixed multi-share is valid.
 - Manifest has a broad `ACTION_SEND_MULTIPLE */*` filter; Kotlin still rejects unsupported MIME types.
-- Release tags use `v<version>`; current version is `0.0.1` / `versionCode = 1`.
+- Release tags use `v<version>`; current released version is `0.0.1` / `versionCode = 1`.
 - Release APK naming: `ShareHelper-v<version>.apk`.
 - Release signing data comes only from environment variables or GitHub Secrets.
 
@@ -78,9 +78,10 @@ ShareHelper/
 - Minimal app surface: no layout XML, no Compose, no launcher flow.
 - Background processing uses a plain `Thread` and returns to UI with `runOnUiThread`.
 - Failure UX is toast + `finish()`.
-- Images prefer metadata mutation, then JPEG re-encode with a tiny pixel difference fallback.
-- MP4 tries `MediaExtractor` + `MediaMuxer` and writes an `application/sharehelper-export` metadata track.
-- Video fallback is deliberately conservative copy for non-MP4 or muxer-rejected inputs.
+- Images are shared as generated HTML files containing an `<img>` data URL; the embedded PNG is direction-corrected and preserves `ExportID` in a PNG text chunk.
+- Videos are shared as generated HTML files containing a `<video controls>` data URL; MP4 tries `MediaExtractor` + `MediaMuxer` metadata remux before embedding.
+- Video fallback is deliberately conservative copy for non-MP4 or muxer-rejected inputs, but the final shared artifact remains HTML.
+- Video export is limited by cache free space rather than a small fixed byte cap; base64 HTML size is estimated before writing when possible.
 - Old cache batches are cleaned at launch after 2 days.
 
 ## COMMANDS
@@ -100,7 +101,7 @@ scripts/publish-release.sh 0.0.1
 
 ## NOTES
 - No `AGENTS.md` / `CLAUDE.md` existed before this file.
-- Kotlin LSP was unavailable in this environment; verify with Gradle tasks instead.
+- Kotlin LSP may be available depending on the agent PATH; always try LSP diagnostics, then verify with Gradle tasks.
 - No `app/src/test` or `app/src/androidTest` source directories currently exist.
 - Lint reports, when generated, use Android default paths under `app/build/reports/lint-results-<variant>.*`.
 - `app/build.gradle.kts` references `proguard-rules.pro`, but no such source file was found; minify is currently disabled.
