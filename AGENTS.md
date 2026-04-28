@@ -5,7 +5,7 @@
 **Branch:** main
 
 ## OVERVIEW
-ShareHelper is a minimal Android share-target app. It receives shared image/video content, writes temporary processed copies under app cache, then opens the system share sheet again.
+ShareHelper is a minimal Android share/open-target app. It receives shared or opened image/video content, writes temporary processed copies under app cache, then opens the system share sheet again.
 
 Stack: Kotlin, Android Gradle Plugin, AndroidX Core KTX, AndroidX ExifInterface, GitHub Actions release automation.
 
@@ -15,7 +15,7 @@ ShareHelper/
 ├── app/                         # Single Android application module
 │   ├── build.gradle.kts          # namespace/applicationId/version/signing
 │   └── src/main/
-│       ├── AndroidManifest.xml   # Share target + FileProvider wiring
+│       ├── AndroidManifest.xml   # Share/open target + FileProvider wiring
 │       ├── java/cn/yojigen/sharehelper/ShareActivity.kt
 │       └── res/                  # strings, theme, launcher icons, file_paths
 ├── .github/workflows/release.yml # tag-triggered signed APK release
@@ -40,9 +40,9 @@ ShareHelper/
 ## CODE MAP
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `ShareActivity` | Activity | `ShareActivity.kt` | Receives `ACTION_SEND` / `ACTION_SEND_MULTIPLE`; processes media off main thread. |
+| `ShareActivity` | Activity | `ShareActivity.kt` | Receives `ACTION_SEND` / `ACTION_SEND_MULTIPLE` / `ACTION_VIEW`; processes media off main thread. |
 | `processIntent` | function | `ShareActivity.kt` | Builds batch ID, output directory, and per-item export IDs. |
-| `collectInputMedia` | function | `ShareActivity.kt` | Reads `clipData` and `EXTRA_STREAM`; de-duplicates URIs. |
+| `collectInputMedia` | function | `ShareActivity.kt` | Reads `clipData`, `EXTRA_STREAM`, and `intent.data`; de-duplicates URIs. |
 | `processImage` | function | `ShareActivity.kt` | Generates a shared HTML wrapper with an embedded base64 direction-corrected PNG data URL; the PNG preserves the `ExportID` text chunk. |
 | `processVideo` | function | `ShareActivity.kt` | Generates shared HTML wrapper with embedded base64 video data; MP4 still remuxes metadata before embedding when possible. |
 | `shareProcessedMedia` | function | `ShareActivity.kt` | Builds outgoing share intent and grants URI read permission. |
@@ -58,6 +58,7 @@ ShareHelper/
 - `FileProvider` authority is `${applicationId}.fileprovider`; Kotlin uses `$packageName.fileprovider`.
 - Supported input classes are images and videos; mixed multi-share is valid.
 - Manifest has a broad `ACTION_SEND_MULTIPLE */*` filter; Kotlin still rejects unsupported MIME types.
+- Manifest registers `ACTION_VIEW` for `content://` and `file://` image/video resources; Kotlin resolves MIME from `ContentResolver`, URI extensions, then `intent.type`.
 - Release tags use `v<version>`; current released version is `0.0.1` / `versionCode = 1`.
 - Release APK naming: `ShareHelper-v<version>.apk`.
 - Release signing data comes only from environment variables or GitHub Secrets.
@@ -77,6 +78,7 @@ ShareHelper/
 ## UNIQUE STYLES
 - Minimal app surface: no layout XML, no Compose, no launcher flow.
 - Background processing uses a plain `Thread` and returns to UI with `runOnUiThread`.
+- Processing UI is a programmatic non-cancelable `Dialog` with manual light/dark colors; Activity window background stays transparent to avoid a full-screen flash.
 - Failure UX is toast + `finish()`.
 - Images are shared as generated HTML files containing an `<img>` data URL; the embedded PNG is direction-corrected and preserves `ExportID` in a PNG text chunk.
 - Videos are shared as generated HTML files containing a `<video controls>` data URL; MP4 tries `MediaExtractor` + `MediaMuxer` metadata remux before embedding.
