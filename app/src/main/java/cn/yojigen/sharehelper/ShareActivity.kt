@@ -1,14 +1,19 @@
 package cn.yojigen.sharehelper
 
 import android.app.Activity
+import android.app.Dialog
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -20,7 +25,9 @@ import android.provider.OpenableColumns
 import android.util.Base64
 import android.util.Base64OutputStream
 import android.view.Gravity
+import android.view.Window
 import android.view.ViewGroup
+import android.webkit.MimeTypeMap
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -43,9 +50,11 @@ import java.util.zip.Deflater
 import kotlin.math.max
 
 class ShareActivity : Activity() {
+    private var loadingDialog: Dialog? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        showLoadingView()
+        showLoadingDialog()
         cleanupOldBatches()
 
         Thread {
@@ -73,29 +82,42 @@ class ShareActivity : Activity() {
         }.start()
     }
 
-    private fun showLoadingView() {
+    private fun showLoadingDialog() {
+        if (isFinishing || isDestroyed) return
+
         val density = resources.displayMetrics.density
+        val isDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val cardColor = if (isDark) Color.rgb(43, 43, 43) else Color.WHITE
+        val textColor = if (isDark) Color.rgb(241, 241, 241) else Color.rgb(32, 32, 32)
+        val progressTint = if (isDark) Color.rgb(180, 205, 255) else Color.rgb(38, 99, 235)
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(Color.WHITE)
             setPadding(
                 (LOADING_HORIZONTAL_PADDING_DP * density).toInt(),
                 (LOADING_VERTICAL_PADDING_DP * density).toInt(),
                 (LOADING_HORIZONTAL_PADDING_DP * density).toInt(),
                 (LOADING_VERTICAL_PADDING_DP * density).toInt(),
             )
+            background = GradientDrawable().apply {
+                setColor(cardColor)
+                cornerRadius = LOADING_DIALOG_CORNER_RADIUS_DP * density
+            }
         }
 
         val messageView = TextView(this).apply {
             text = getString(R.string.loading_message)
             gravity = Gravity.CENTER
             textSize = LOADING_TEXT_SIZE_SP
-            setTextColor(Color.rgb(32, 32, 32))
+            setTextColor(textColor)
         }
 
         container.addView(
-            ProgressBar(this).apply { isIndeterminate = true },
+            ProgressBar(this).apply {
+                isIndeterminate = true
+                indeterminateTintList = ColorStateList.valueOf(progressTint)
+            },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
         container.addView(
@@ -105,7 +127,20 @@ class ShareActivity : Activity() {
             },
         )
 
-        setContentView(container)
+        loadingDialog = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setCancelable(false)
+            setContentView(container)
+            show()
+            window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            window?.setDimAmount(if (isDark) LOADING_DIALOG_DARK_DIM_AMOUNT else LOADING_DIALOG_LIGHT_DIM_AMOUNT)
+            window?.setLayout(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+    }
+
+    private fun dismissLoadingDialog() {
+        loadingDialog?.takeIf { it.isShowing }?.dismiss()
+        loadingDialog = null
     }
 
     private fun processIntent(sourceIntent: Intent): List<ProcessedMedia> {
@@ -140,6 +175,7 @@ class ShareActivity : Activity() {
 
             IntentCompat.getParcelableExtra(sourceIntent, Intent.EXTRA_STREAM, Uri::class.java)?.let { uri -> add(uri) }
             IntentCompat.getParcelableArrayListExtra(sourceIntent, Intent.EXTRA_STREAM, Uri::class.java)?.let { streamUris -> addAll(streamUris) }
+            sourceIntent.data?.let { uri -> add(uri) }
         }.distinctBy { it.toString() }
 
         return uris.mapNotNull { uri ->
@@ -149,12 +185,9 @@ class ShareActivity : Activity() {
     }
 
     private fun resolveMediaMimeType(uri: Uri, fallbackMimeType: String?): String? {
-        val resolvedMimeType = contentResolver.getType(uri)
-        return when {
-            resolvedMimeType.isSupportedMediaMimeType() -> resolvedMimeType
-            fallbackMimeType.isSupportedMediaMimeType() -> fallbackMimeType
-            else -> null
-        }
+        return contentResolver.getType(uri).supportedMediaMimeTypeOrNull()
+            ?: uri.extensionMimeTypeOrNull()
+            ?: fallbackMimeType.supportedMediaMimeTypeOrNull()
     }
 
     private fun processImage(uri: Uri, batchDirectory: File, fileID: String, exportID: String): ProcessedMedia {
@@ -605,6 +638,7 @@ class ShareActivity : Activity() {
         }
 
         try {
+            dismissLoadingDialog()
             startActivity(Intent.createChooser(shareIntent, getString(R.string.share_chooser_title)))
             finish()
         } catch (_: ActivityNotFoundException) {
@@ -638,8 +672,14 @@ class ShareActivity : Activity() {
     }
 
     private fun showToastAndFinish(message: String) {
+        dismissLoadingDialog()
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         finish()
+    }
+
+    override fun onDestroy() {
+        dismissLoadingDialog()
+        super.onDestroy()
     }
 
     private fun videoExtensionFor(mimeType: String): String {
@@ -656,8 +696,17 @@ class ShareActivity : Activity() {
         return this
     }
 
-    private fun String?.isSupportedMediaMimeType(): Boolean {
-        return this != null && (startsWith(IMAGE_MIME_PREFIX) || (startsWith(VIDEO_MIME_PREFIX) && this != VIDEO_WILDCARD_MIME_TYPE))
+    private fun String?.supportedMediaMimeTypeOrNull(): String? {
+        val mimeType = this?.substringBefore(';')?.trim()?.lowercase(Locale.US) ?: return null
+        return mimeType.takeIf { it.startsWith(IMAGE_MIME_PREFIX) || (it.startsWith(VIDEO_MIME_PREFIX) && it != VIDEO_WILDCARD_MIME_TYPE) }
+    }
+
+    private fun Uri.extensionMimeTypeOrNull(): String? {
+        val extension = MimeTypeMap.getFileExtensionFromUrl(toString()).ifBlank {
+            lastPathSegment?.substringAfterLast('.', missingDelimiterValue = "").orEmpty()
+        }.lowercase(Locale.US)
+        if (extension.isBlank()) return null
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension).supportedMediaMimeTypeOrNull()
     }
 
     private fun String.toHtmlAttributeText(): String {
@@ -778,6 +827,9 @@ class ShareActivity : Activity() {
         const val LOADING_VERTICAL_PADDING_DP = 24
         const val LOADING_TEXT_TOP_MARGIN_DP = 16
         const val LOADING_TEXT_SIZE_SP = 16f
+        const val LOADING_DIALOG_CORNER_RADIUS_DP = 18
+        const val LOADING_DIALOG_LIGHT_DIM_AMOUNT = 0.24f
+        const val LOADING_DIALOG_DARK_DIM_AMOUNT = 0.42f
         const val PNG_BIT_DEPTH = 8
         const val PNG_COLOR_TYPE_RGBA = 6
         const val PNG_COMPRESSION_DEFLATE = 0
